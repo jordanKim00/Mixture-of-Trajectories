@@ -40,7 +40,7 @@ if [ ! -f "outputs/${RUN}/trajectory_adapter.pt" ]; then
     --num_trajectories "${TRAJ}" \
     --steps "${STEPS}" \
     --batch_size 2 \
-    --max_length 512 \
+    --max_length 1024 \
     --noise_init_std 0.5 \
     --noise_scale 0.3 \
     --noise_l2_weight 1e-5 \
