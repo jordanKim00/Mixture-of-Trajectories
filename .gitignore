@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.env
+.env.*
+.venv/
+venv/
+
+# Logs and experiment outputs
+logs/
+wandb/
+runs/
+outputs/
+checkpoints/
+
+# Model/cache artifacts
+.cache/
+hf_cache/
+docker_hf-cache/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
