@@ -180,17 +180,22 @@ perspectives.
 
 ## Target Evaluation Data
 
-The research claim is that aggregated latent views help on challenging,
-heterogeneous inputs — the latent analogue of querying several different
-models. A single-domain eval cannot test this: one fixed seed direction could
-simply overfit that domain. The target suite should therefore be multi-domain
-and difficulty-skewed, for example:
+The primary suite matches the RoE setting (arXiv:2509.17238) so the closest
+prior work is directly comparable. `scripts/prepare_eval_data.py` downloads
+all twelve tasks and `scripts/evaluate.py` runs them:
 
-- MMLU-Pro: multi-domain, reasoning-heavy multiple choice.
-- BBH (BIG-Bench Hard): heterogeneous reasoning task collection.
-- GPQA-Diamond: graduate-level science questions.
-- MATH-500: competition mathematics.
-- MuSR: multi-step soft reasoning over long narratives.
+- math (generation + last-number extraction): GSM8K, SVAMP, AddSub, SingleEq,
+  MultiArith.
+- commonsense (choice log-likelihood): ARC-Easy, ARC-Challenge, OpenBookQA,
+  Social-IQA, HellaSwag.
+- code (samples for offline evalplus): HumanEval, HumanEval+.
+
+These twelve tasks are contamination-protected: every training stage passes
+the n-gram decontamination filter in `scripts/decontamination.py` against
+`data/eval/`. A harder multi-domain extension (MMLU-Pro, BBH, GPQA-Diamond,
+MATH-500, MuSR) remains the follow-up suite once the RoE-matched comparison is
+established, because the heterogeneous-ensemble framing predicts the largest
+gains on difficulty-skewed inputs.
 
 Reporting rules for this suite:
 

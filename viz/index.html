@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>MoE Trajectory Trace Viewer</title>
+<style>
+  :root {
+    --base-color: #8a8f98;
+    --traj1: #2f6fed; --traj2: #e8702a; --traj3: #1faa59; --traj4: #b03ad6;
+    --null-color: #c2c7cf;
+  }
+  body { font-family: 'Segoe UI', sans-serif; margin: 0; background: #f6f7f9; color: #1c1e21; }
+  header { background: #20232a; color: #fff; padding: 10px 18px; display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .meta { font-size: 12px; color: #9aa3b2; }
+  main { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(560px, 1.2fr); gap: 14px; padding: 14px; }
+  section { background: #fff; border-radius: 10px; padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  h2 { font-size: 13px; margin: 0 0 10px; color: #444; text-transform: uppercase; letter-spacing: .04em; }
+  #tokens { line-height: 2.1; word-break: break-all; }
+  .tok { padding: 2px 1px; border-radius: 4px; cursor: pointer; white-space: pre-wrap; }
+  .tok.prompt { color: #9aa0a8; }
+  .tok.gen { color: #111; }
+  .tok:hover { outline: 1.5px solid #2f6fed; }
+  .tok.selected { outline: 2px solid #e8702a; background: #fff3ec !important; }
+  #detail .row { margin-bottom: 12px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; margin-right: 6px; background: #eef1f5; }
+  .alpha-bar { display: flex; height: 18px; border-radius: 5px; overflow: hidden; border: 1px solid #d8dce3; }
+  .alpha-seg { height: 100%; }
+  .legend { font-size: 12px; color: #555; margin-top: 6px; }
+  .legend span { display: inline-flex; align-items: center; margin-right: 12px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 4px; }
+  table.preds { border-collapse: collapse; font-size: 13px; width: 100%; }
+  table.preds td, table.preds th { border-bottom: 1px solid #eceff3; padding: 4px 8px; text-align: left; }
+  table.preds .tokcell { font-family: monospace; background: #f3f5f8; border-radius: 4px; padding: 1px 5px; }
+  #grid-wrap { overflow-x: auto; }
+  #routing-grid { display: block; }
+  .hint { font-size: 12px; color: #777; }
+  #loader { padding: 30px; text-align: center; }
+  .divergent { color: #e8702a; font-weight: 600; }
+  #tooltip { position: fixed; pointer-events: none; background: #20232a; color: #fff; font-size: 12px;
+             padding: 4px 8px; border-radius: 5px; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Seeded Latent Trajectory Trace</h1>
+  <span class="meta" id="meta-line">trace 미로딩</span>
+  <input type="file" id="file-input" accept=".json">
+</header>
+<div id="loader">
+  <p>URL 파라미터 <code>?trace=traces/trace.json</code> 로 자동 로딩하거나, 위에서 JSON 파일을 선택하세요.</p>
+  <p class="hint">생성: <code>python scripts/generate_traced.py --prompt "..."</code> → 서빙: <code>python -m http.server -d viz 8000</code></p>
+</div>
+<main style="display:none" id="main">
+  <section>
+    <h2>Tokens <span class="hint">(클릭 → 해당 토큰을 생성한 경로; 진한 파랑 = noisy trajectory 사용량)</span></h2>
+    <div id="tokens"></div>
+    <div class="legend" id="token-legend"></div>
+  </section>
+  <section>
+    <h2 id="detail-title">Token Detail</h2>
+    <div id="detail"><p class="hint">왼쪽에서 토큰을 클릭하세요.</p></div>
+    <div id="grid-wrap"><svg id="routing-grid"></svg></div>
+  </section>
+</main>
+<div id="tooltip"></div>
+<script>
+const TRAJ_COLORS = ['#8a8f98', '#2f6fed', '#e8702a', '#1faa59', '#b03ad6'];
+let TRACE = null;
+
+function decode(text) { return text.replace(/\n/g, '↵'); }
+
+async function tryUrlTrace() {
+  const params = new URLSearchParams(location.search);
+  const path = params.get('trace');
+  if (!path) return;
+  try {
+    const res = await fetch(path);
+    if (res.ok) loadTrace(await res.json());
+  } catch (err) { console.warn('trace fetch failed', err); }
+}
+document.getElementById('file-input').addEventListener('change', (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => loadTrace(JSON.parse(reader.result));
+  reader.readAsText(file);
+});
+
+function altMassAt(pos) {
+  // alpha rows: P alt trajectories (+ optional null), columns: positions
+  if (!TRACE || pos < 0 || pos >= TRACE.alpha[0].length) return 0;
+  const numAlt = TRACE.meta.num_trajectories - 1;
+  let mass = 0;
+  for (let p = 0; p < numAlt; p++) mass += TRACE.alpha[p][pos];
+  return mass;
+}
+
+function loadTrace(trace) {
+  TRACE = trace;
+  document.getElementById('loader').style.display = 'none';
+  document.getElementById('main').style.display = 'grid';
+  const meta = trace.meta;
+  document.getElementById('meta-line').textContent =
+    `${meta.model} | N=${meta.num_trajectories} | top-k=${meta.top_k}/${meta.n_experts} experts | ` +
+    `seed layer=${meta.seed_target_layer} | seed scales=[${meta.seed_scales}] | adapter=${meta.adapter || 'none'}`;
+  const holder = document.getElementById('tokens');
+  holder.innerHTML = '';
+  trace.tokens.forEach((token, idx) => {
+    const span = document.createElement('span');
+    span.className = 'tok ' + (token.is_generated ? 'gen' : 'prompt');
+    span.textContent = decode(token.text);
+    if (token.is_generated && idx > 0) {
+      const mass = altMassAt(idx - 1);
+      span.style.background = `rgba(47,111,237,${Math.min(0.85, mass * 1.6)})`;
+      if (mass > 0.3) span.style.color = '#fff';
+      span.title = `alt trajectory mass: ${(mass * 100).toFixed(1)}%`;
+    }
+    span.addEventListener('click', () => selectToken(idx, span));
+    holder.appendChild(span);
+  });
+  const numAlt = meta.num_trajectories - 1;
+  let legend = '<span><span class="swatch" style="background:'+TRAJ_COLORS[0]+'"></span>base</span>';
+  for (let p = 1; p <= numAlt; p++)
+    legend += `<span><span class="swatch" style="background:${TRAJ_COLORS[p]}"></span>traj ${p}</span>`;
+  if (meta.include_null_candidate)
+    legend += '<span><span class="swatch" style="background:var(--null-color)"></span>null(기권)</span>';
+  document.getElementById('token-legend').innerHTML = legend;
+}
+
+function tokenString(id) {
+  return (TRACE.token_strings && TRACE.token_strings[String(id)] !== undefined)
+    ? TRACE.token_strings[String(id)] : String(id);
+}
+
+function selectToken(idx, span) {
+  document.querySelectorAll('.tok.selected').forEach((el) => el.classList.remove('selected'));
+  span.classList.add('selected');
+  const pos = idx - 1; // computation at pos predicted token idx
+  const detail = document.getElementById('detail');
+  document.getElementById('detail-title').textContent =
+    `Token #${idx} "${decode(TRACE.tokens[idx].text)}" — 위치 ${pos}의 forward가 생성`;
+  if (pos < 0) {
+    detail.innerHTML = '<p class="hint">첫 토큰은 생성 경로가 없습니다.</p>';
+    drawGrid(null);
+    return;
+  }
+  const meta = TRACE.meta;
+  const numAlt = meta.num_trajectories - 1;
+  const hasNull = meta.include_null_candidate;
+
+  // alpha bar
+  let segs = '';
+  let legendRows = '';
+  const labels = [];
+  for (let p = 0; p < numAlt; p++) labels.push({ name: `traj ${p + 1}`, color: TRAJ_COLORS[p + 1], value: TRACE.alpha[p][pos] });
+  if (hasNull) labels.push({ name: 'null', color: 'var(--null-color)', value: TRACE.alpha[numAlt][pos] });
+  labels.forEach((lab) => {
+    segs += `<div class="alpha-seg" style="width:${(lab.value * 100).toFixed(2)}%;background:${lab.color}"></div>`;
+    legendRows += `<span><span class="swatch" style="background:${lab.color}"></span>${lab.name}: ${(lab.value * 100).toFixed(1)}%</span>`;
+  });
+
+  // predictions table
+  const fusedId = TRACE.fused_top1.ids[pos];
+  const baseId = TRACE.base_top1.ids[pos];
+  const changed = fusedId !== baseId;
+  let rows = `<tr><th>route</th><th>top-1 token</th><th>logprob</th><th>final hidden cos(base)</th></tr>`;
+  for (let t = 0; t < meta.num_trajectories; t++) {
+    const top = TRACE.traj_top1[t];
+    const cos = t === 0 ? '1.0' : (TRACE.base_alt_cosine[t - 1][pos]).toFixed(4);
+    const name = t === 0 ? 'base' : `traj ${t}`;
+    rows += `<tr><td><span class="swatch" style="background:${TRAJ_COLORS[t]}"></span>${name}</td>` +
+            `<td><span class="tokcell">${decode(tokenString(top.ids[pos]))}</span></td>` +
+            `<td>${top.logprobs[pos].toFixed(3)}</td><td>${cos}</td></tr>`;
+  }
+  rows += `<tr><td><b>fused</b></td><td><span class="tokcell">${decode(tokenString(fusedId))}</span>` +
+          (changed ? ' <span class="divergent">≠ base</span>' : ' (= base)') +
+          `</td><td>${TRACE.fused_top1.logprobs[pos].toFixed(3)}</td><td>—</td></tr>`;
+
+  detail.innerHTML =
+    `<div class="row"><span class="pill">aggregator α @pos ${pos}</span>` +
+    `<div class="alpha-bar">${segs}</div><div class="legend">${legendRows}</div></div>` +
+    `<div class="row"><table class="preds">${rows}</table></div>` +
+    `<div class="row hint">아래 그리드: 행 그룹 = MoE layer, 행 = trajectory, 열 = expert id. ` +
+    `칠해진 칸 = 그 layer에서 선택된 top-k expert (불투명도 = gate weight). ` +
+    `<span class="divergent">주황 layer 라벨</span> = base와 다른 expert 집합을 쓴 layer.</div>`;
+  drawGrid(pos);
+}
+
+function drawGrid(pos) {
+  const svg = document.getElementById('routing-grid');
+  svg.innerHTML = '';
+  if (pos === null || !TRACE) return;
+  const meta = TRACE.meta;
+  const layers = meta.moe_layers;
+  const E = meta.n_experts;
+  const N = meta.num_trajectories;
+  const cell = 11, rowH = 7, layerGap = 6, labelW = 52;
+  const width = labelW + E * cell + 10;
+  const height = layers.length * (N * rowH + layerGap) + 20;
+  svg.setAttribute('width', width);
+  svg.setAttribute('height', height);
+  const tooltip = document.getElementById('tooltip');
+  const ns = 'http://www.w3.org/2000/svg';
+  let y = 10;
+  layers.forEach((layer) => {
+    const payload = TRACE.routing[String(layer)];
+    const sets = [];
+    for (let t = 0; t < N; t++) sets.push(new Set(payload.topk_idx[t][pos]));
+    let diverged = false;
+    for (let t = 1; t < N; t++) {
+      if (sets[t].size !== sets[0].size || [...sets[t]].some((e) => !sets[0].has(e))) { diverged = true; break; }
+    }
+    const label = document.createElementNS(ns, 'text');
+    label.setAttribute('x', 4); label.setAttribute('y', y + (N * rowH) / 2 + 4);
+    label.setAttribute('font-size', '10');
+    label.setAttribute('fill', diverged ? '#e8702a' : '#888');
+    label.setAttribute('font-weight', diverged ? '700' : '400');
+    label.textContent = 'L' + layer + (layer === meta.seed_target_layer ? '*' : '');
+    svg.appendChild(label);
+    for (let t = 0; t < N; t++) {
+      const ids = payload.topk_idx[t][pos];
+      const weights = payload.topk_weight[t][pos];
+      // faint row background
+      const bg = document.createElementNS(ns, 'rect');
+      bg.setAttribute('x', labelW); bg.setAttribute('y', y + t * rowH);
+      bg.setAttribute('width', E * cell); bg.setAttribute('height', rowH - 1);
+      bg.setAttribute('fill', '#f1f3f6');
+      svg.appendChild(bg);
+      ids.forEach((expert, j) => {
+        const rect = document.createElementNS(ns, 'rect');
+        rect.setAttribute('x', labelW + expert * cell);
+        rect.setAttribute('y', y + t * rowH);
+        rect.setAttribute('width', cell - 1);
+        rect.setAttribute('height', rowH - 1);
+        const novel = t > 0 && !sets[0].has(expert);
+        rect.setAttribute('fill', TRAJ_COLORS[t]);
+        rect.setAttribute('fill-opacity', Math.max(0.35, Math.min(1, weights[j] * 2.2)));
+        if (novel) { rect.setAttribute('stroke', '#111'); rect.setAttribute('stroke-width', '1.2'); }
+        rect.addEventListener('mousemove', (event) => {
+          tooltip.style.display = 'block';
+          tooltip.style.left = (event.clientX + 12) + 'px';
+          tooltip.style.top = (event.clientY + 12) + 'px';
+          tooltip.textContent = `L${layer} ${t === 0 ? 'base' : 'traj ' + t} · expert ${expert} · w=${weights[j]}` +
+            (novel ? ' · base에 없음' : '');
+        });
+        rect.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+        svg.appendChild(rect);
+      });
+    }
+    y += N * rowH + layerGap;
+  });
+}
+
+tryUrlTrace();
+</script>
+</body>
+</html>

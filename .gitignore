@@ -13,12 +13,20 @@ __pycache__/
 venv/
 
 # Logs and experiment outputs
-data/
+data/*
+!data/eval/
+!data/train/
+data/eval/*
+data/train/*
+!data/eval/.gitkeep
+!data/train/.gitkeep
 logs/
 wandb/
 runs/
+results/
 outputs/
 checkpoints/
+viz/traces/
 
 # Model/cache artifacts
 .cache/

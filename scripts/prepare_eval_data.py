@@ -110,7 +110,8 @@ def _rows_openbookqa() -> Iterable[Dict[str, object]]:
 def _rows_siqa() -> Iterable[Dict[str, object]]:
     from datasets import load_dataset
 
-    for row in load_dataset("allenai/social_i_qa", split="validation", trust_remote_code=True):
+    # Parquet mirror; allenai/social_i_qa's loader script breaks on datasets>=3.
+    for row in load_dataset("lighteval/siqa", split="validation"):
         yield {
             "task": "siqa",
             "question": f"{row['context']} {row['question']}",
@@ -161,7 +162,7 @@ TASK_LOADERS: Dict[str, Callable[[], Iterable[Dict[str, object]]]] = {
     "gsm8k": _rows_gsm8k,
     "svamp": _rows_svamp,
     "addsub": lambda: _rows_lila("addsub", "addsub"),
-    "singleeq": lambda: _rows_lila("singleeq", "singleeq"),
+    "singleeq": lambda: _rows_lila("singleq", "singleeq"),
     "multiarith": _rows_multiarith,
     "arc_easy": lambda: _rows_arc("ARC-Easy", "arc_easy"),
     "arc_challenge": lambda: _rows_arc("ARC-Challenge", "arc_challenge"),

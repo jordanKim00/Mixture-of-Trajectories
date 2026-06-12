@@ -35,6 +35,19 @@ grad_summary = _TRAIN_ADAPTER.grad_summary
 freeze_seed_noise = _TRAIN_ADAPTER.freeze_seed_noise
 
 
+def _load_script_module(name: str, filename: str):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / filename)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_DECONTAM = _load_script_module("decontamination_for_tests", "decontamination.py")
+_EVALUATE = _load_script_module("evaluate_for_tests", "evaluate.py")
+
+
 class ToyEncoding:
     def __init__(self, input_ids):
         self.input_ids = input_ids
@@ -962,6 +975,62 @@ def test_freeze_seed_noise_trains_aggregator_only_but_keeps_noise_active() -> No
     assert float(model.router_noise.effective_noise().abs().sum()) > 0.0
 
 
+def test_token_routing_trace_capture_shapes_and_alpha() -> None:
+    torch.manual_seed(26)
+    base = TinyCausalLM()
+    model = TrajectoryEnsembleForCausalLM(
+        base_model=base,
+        num_trajectories=3,
+        agg_dim=4,
+        noise_scale=0.4,
+        top_k=2,
+    )
+    input_ids = torch.tensor([[1, 3, 4, 5], [1, 6, 7, 2]], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    output = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        return_token_routing=True,
+        return_pre_norm_hidden=True,
+        return_aggregator_alpha=True,
+    )
+    assert output.token_routing is not None
+    assert sorted(output.token_routing) == [1, 2]
+    for payload in output.token_routing.values():
+        assert payload["topk_idx"].shape == (2, 3, 4, 2)
+        assert payload["topk_weight"].shape == (2, 3, 4, 2)
+        assert int(payload["topk_idx"].max()) < 4
+    assert output.pre_norm_by_traj is not None
+    assert output.pre_norm_by_traj.shape == (2, 3, 4, 8)
+    assert output.aggregator_alpha is not None
+    assert output.aggregator_alpha.shape == (2, 3, 4)  # 2 alts + null
+    assert torch.allclose(output.aggregator_alpha.sum(dim=1), torch.ones(2, 4), atol=1e-5)
+    # Trace flags must not leak into later plain forwards.
+    plain = model(input_ids=input_ids, attention_mask=attention_mask)
+    assert plain.token_routing is None
+    assert not model.router_noise.record_token_routing
+
+
+def test_decontamination_ngram_filter_catches_eval_overlap() -> None:
+    eval_question = "Natalia sold clips to 48 of her friends in April and then half as many in May"
+    index = _DECONTAM.text_ngrams(eval_question, n=8)
+    leaked = "Q: Natalia sold clips to 48 of her friends in April and then half as many in May. A: 72"
+    clean = "The weather in April was unusually warm and many friends visited the park together."
+    assert _DECONTAM.is_contaminated(leaked, index, n=8)
+    assert not _DECONTAM.is_contaminated(clean, index, n=8)
+    short_index = _DECONTAM.text_ngrams("what is two plus two", n=8)
+    assert _DECONTAM.is_contaminated("what is two plus two", short_index, n=8)
+
+
+def test_evaluate_answer_extraction_and_code_truncation() -> None:
+    assert _EVALUATE.extract_last_number("the answer is #### 1,234.5 ok") == "1234.5"
+    assert _EVALUATE.extract_last_number("no digits here") is None
+    assert _EVALUATE.numbers_match("42", "42.0")
+    assert not _EVALUATE.numbers_match("41", "42")
+    body = "    return x + 1\n\ndef next_function():\n    pass"
+    assert _EVALUATE.truncate_code(body) == "    return x + 1\n"
+
+
 def test_encode_batch_masks_prompt_but_keeps_completion_targets() -> None:
     tokenizer = ToyTokenizer()
     batch = encode_batch(
@@ -1070,6 +1139,9 @@ if __name__ == "__main__":
     test_selective_kl_weight_relaxes_preservation_where_alternatives_win()
     test_forward_selective_kl_is_finite_and_bounded_at_identity_init()
     test_freeze_seed_noise_trains_aggregator_only_but_keeps_noise_active()
+    test_token_routing_trace_capture_shapes_and_alpha()
+    test_decontamination_ngram_filter_catches_eval_overlap()
+    test_evaluate_answer_extraction_and_code_truncation()
     test_encode_batch_masks_prompt_but_keeps_completion_targets()
     test_encode_batch_can_train_on_full_text_or_prompt()
     test_encode_batch_supports_last_assistant_message_as_target()

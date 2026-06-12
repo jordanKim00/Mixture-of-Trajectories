@@ -36,16 +36,34 @@ python scripts/smoke_generate.py --num_trajectories 3 --max_new_tokens 4
 The smoke scripts load the cached DeepSeek-MoE checkpoint with
 `local_files_only=True` by default.
 
-Evaluation data helpers:
+Data, evaluation, and the end-to-end POC:
 
 ```bash
-python scripts/prepare_eval_data.py --out_dir data/eval
+python scripts/prepare_eval_data.py --out_dir data/eval        # RoE-matched 12 tasks
 python scripts/prepare_train_data.py --out_dir data/train --eval_dir data/eval
 python scripts/mine_hard_prefixes.py --pool data/train/stage1_continuation.jsonl
+python scripts/evaluate.py --mode base  --tasks math --limit 100
+python scripts/evaluate.py --mode fused --adapter outputs/adapter/trajectory_adapter.pt
+bash scripts/run_poc.sh   # data -> mine -> train -> eval -> trace, with GPU check
 ```
 
 `scripts/decontamination.py` builds n-gram filters from `data/eval/*.jsonl` so
-adapter training data can be checked against the evaluation suite.
+adapter training data can be checked against the evaluation suite; see
+[data/README.md](data/README.md) for the mixture design and
+[results comparison] in `results/*/metrics.json` after evaluation runs.
+
+Per-token trajectory visualization:
+
+```bash
+python scripts/generate_traced.py --prompt "..." --out viz/traces/trace.json
+python -m http.server -d viz 8000   # open http://localhost:8000/?trace=traces/trace.json
+```
+
+The viewer colors generated tokens by noisy-trajectory usage; clicking a token
+opens the forward position that produced it: aggregator alpha (including null
+abstention), per-trajectory top-1 predictions, final-hidden cosine to base, and
+a layer-by-expert grid of every trajectory's top-k routing path with
+base-divergent layers and experts highlighted.
 
 Adapter training:
 

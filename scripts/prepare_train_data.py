@@ -63,8 +63,9 @@ def _docs_openwebmath() -> Iterator[Dict[str, str]]:
         yield {"text": _truncate(row["text"])}
 
 
-def _docs_stack_smol() -> Iterator[Dict[str, str]]:
-    for row in _stream("bigcode/the-stack-smol", "data/python"):
+def _docs_codeparrot() -> Iterator[Dict[str, str]]:
+    # Public (ungated) Python corpus; the-stack v1/v2 require authentication.
+    for row in _stream("codeparrot/codeparrot-clean"):
         yield {"text": _truncate(row["content"])}
 
 
@@ -77,7 +78,7 @@ STAGE1_SOURCES: List[tuple[str, float, Callable[[], Iterator[Dict[str, str]]]]] 
     ("fineweb_edu", 0.40, _docs_fineweb_edu),
     ("slimpajama", 0.20, _docs_slimpajama),
     ("openwebmath", 0.15, _docs_openwebmath),
-    ("stack_python", 0.15, _docs_stack_smol),
+    ("codeparrot_python", 0.15, _docs_codeparrot),
     ("wikipedia", 0.10, _docs_wikipedia),
 ]
 
@@ -116,10 +117,15 @@ def _sft_commonsenseqa() -> Iterator[Dict[str, object]]:
         }
 
 
-def _sft_piqa() -> Iterator[Dict[str, object]]:
-    for row in _stream("ybisk/piqa", trust_remote_code=True):
-        answer = row["sol1"] if int(row["label"]) == 0 else row["sol2"]
-        yield {"prompt": f"Goal: {row['goal']}\nAnswer:", "completion": f" {answer}"}
+def _sft_strategyqa() -> Iterator[Dict[str, object]]:
+    # PIQA's hub loader script is broken on datasets>=3; StrategyQA keeps the
+    # implicit-reasoning commonsense bucket instead.
+    for row in _stream("ChilleD/StrategyQA"):
+        answer = "yes" if row["answer"] else "no"
+        yield {
+            "prompt": f"Question: {row['question']}\nAnswer yes or no:",
+            "completion": f" {answer}",
+        }
 
 
 def _sft_winogrande() -> Iterator[Dict[str, object]]:
@@ -151,7 +157,7 @@ STAGE3_SOURCES: List[tuple[str, float, Callable[[], Iterator[Dict[str, object]]]
     ("numinamath", 0.20, _sft_numinamath),
     ("codefeedback", 0.20, _sft_codefeedback),
     ("commonsenseqa", 0.05, _sft_commonsenseqa),
-    ("piqa", 0.04, _sft_piqa),
+    ("strategyqa", 0.04, _sft_strategyqa),
     ("winogrande", 0.03, _sft_winogrande),
     ("sciq", 0.10, _sft_sciq),
     ("hotpotqa", 0.13, _sft_hotpotqa),
