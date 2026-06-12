@@ -154,9 +154,16 @@ class BaseRunner:
         return output.logits.float()
 
     @torch.no_grad()
-    def greedy(self, input_ids: torch.Tensor, max_new_tokens: int, eos_token_id: Optional[int]) -> torch.Tensor:
+    def greedy(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_new_tokens: int,
+        eos_token_id: Optional[int],
+    ) -> torch.Tensor:
         return self.model.generate(
             input_ids=input_ids.to(self.input_device),
+            attention_mask=attention_mask.to(self.input_device),
             max_new_tokens=max_new_tokens,
             do_sample=False,
             eos_token_id=eos_token_id,
@@ -187,67 +194,99 @@ def choice_texts(record: Dict[str, object]) -> tuple[str, List[str]]:
     return f"Question: {question}\nAnswer:", [" " + choice for choice in choices]
 
 
-@torch.no_grad()
-def score_choices(runner, tokenizer, prompt: str, choices: List[str]) -> tuple[List[float], List[float]]:
-    prompt_ids = tokenizer(prompt, add_special_tokens=True).input_ids
-    sums: List[float] = []
-    means: List[float] = []
-    for choice in choices:
-        choice_ids = tokenizer(choice, add_special_tokens=False).input_ids
-        if not choice_ids:
-            sums.append(float("-inf"))
-            means.append(float("-inf"))
-            continue
-        full = torch.tensor([prompt_ids + choice_ids], dtype=torch.long)
-        attention = torch.ones_like(full)
-        logits = runner.logits(full, attention)
-        log_probs = F.log_softmax(logits[:, :-1].float(), dim=-1)
-        targets = full[:, 1:].to(log_probs.device)
-        token_lp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)[0]
-        choice_lp = token_lp[len(prompt_ids) - 1 :]
-        sums.append(float(choice_lp.sum()))
-        means.append(float(choice_lp.mean()))
-    return sums, means
+def _left_padded_batch(tokenizer, prompts: List[str]) -> tuple[torch.Tensor, torch.Tensor]:
+    pad_id = tokenizer.pad_token_id
+    encoded = [tokenizer(prompt, add_special_tokens=False).input_ids for prompt in prompts]
+    width = max(len(ids) for ids in encoded)
+    rows = [[pad_id] * (width - len(ids)) + ids for ids in encoded]
+    mask = [[0] * (width - len(ids)) + [1] * len(ids) for ids in encoded]
+    return torch.tensor(rows, dtype=torch.long), torch.tensor(mask, dtype=torch.long)
+
+
+def _batched_generate(runner, tokenizer, task: str, prompts: List[str], args) -> List[str]:
+    """Greedy-generate prompts in left-padded batches; returns completions."""
+
+    completions: List[str] = []
+    eos = tokenizer.eos_token_id
+    for start in range(0, len(prompts), args.batch_size):
+        chunk = prompts[start : start + args.batch_size]
+        input_ids, attention_mask = _left_padded_batch(tokenizer, chunk)
+        generated = runner.greedy(input_ids, attention_mask, args.max_new_tokens, eos)
+        width = input_ids.shape[1]
+        for row in generated[:, width:]:
+            completions.append(tokenizer.decode(row, skip_special_tokens=True))
+        print(f"[{task}] generated {len(completions)}/{len(prompts)}")
+    return completions
 
 
 def run_math_task(runner, tokenizer, task: str, rows, args, out_dir: Path) -> Dict[str, object]:
+    prompts = [math_prompt(tokenizer, str(row["question"])) for row in rows]
+    completions = _batched_generate(runner, tokenizer, task, prompts, args)
     correct = 0
     records = []
-    eos = tokenizer.eos_token_id
-    for idx, row in enumerate(rows):
-        prompt = math_prompt(tokenizer, str(row["question"]))
-        input_ids = torch.tensor([tokenizer(prompt, add_special_tokens=False).input_ids], dtype=torch.long)
-        generated = runner.greedy(input_ids, args.max_new_tokens, eos)
-        completion = tokenizer.decode(generated[0, input_ids.shape[1] :], skip_special_tokens=True)
+    for idx, (row, completion) in enumerate(zip(rows, completions)):
         pred = extract_last_number(completion)
         ok = numbers_match(pred, str(row["answer"]))
         correct += int(ok)
         records.append(
             {"task": task, "idx": idx, "pred": pred, "gold": row["answer"], "correct": ok, "completion": completion}
         )
-        if (idx + 1) % 10 == 0:
-            print(f"[{task}] {idx + 1}/{len(rows)} acc={correct / (idx + 1):.3f}")
     _write_records(out_dir / f"{task}.jsonl", records)
     return {"task": task, "n": len(rows), "accuracy": correct / max(len(rows), 1)}
 
 
+@torch.no_grad()
 def run_choice_task(runner, tokenizer, task: str, rows, args, out_dir: Path) -> Dict[str, object]:
+    # Flatten every (question, choice) pair into one row, then score in chunks.
+    # Scoring uses RIGHT padding: valid tokens stay left-aligned, so arange
+    # position ids remain correct and padded tails are masked out.
+    flat: List[tuple[int, int, List[int]]] = []
+    for q_idx, row in enumerate(rows):
+        prompt, choices = choice_texts(row)
+        prompt_ids = tokenizer(prompt, add_special_tokens=True).input_ids
+        for choice in choices:
+            choice_ids = tokenizer(choice, add_special_tokens=False).input_ids
+            if not choice_ids:
+                choice_ids = [tokenizer.eos_token_id]
+            flat.append((q_idx, len(prompt_ids), prompt_ids + choice_ids))
+
+    pad_id = tokenizer.pad_token_id
+    sums: List[List[float]] = [[] for _ in rows]
+    means: List[List[float]] = [[] for _ in rows]
+    scored = 0
+    for start in range(0, len(flat), args.score_batch):
+        chunk = flat[start : start + args.score_batch]
+        width = max(len(item[2]) for item in chunk)
+        ids = torch.tensor(
+            [item[2] + [pad_id] * (width - len(item[2])) for item in chunk], dtype=torch.long
+        )
+        mask = torch.tensor(
+            [[1] * len(item[2]) + [0] * (width - len(item[2])) for item in chunk], dtype=torch.long
+        )
+        logits = runner.logits(ids, mask)
+        log_probs = F.log_softmax(logits[:, :-1].float(), dim=-1)
+        targets = ids[:, 1:].to(log_probs.device)
+        token_lp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        for row_idx, (q_idx, prompt_len, full) in enumerate(chunk):
+            choice_lp = token_lp[row_idx, prompt_len - 1 : len(full) - 1]
+            sums[q_idx].append(float(choice_lp.sum()))
+            means[q_idx].append(float(choice_lp.mean()))
+        scored += len(chunk)
+        if (start // args.score_batch) % 10 == 0:
+            print(f"[{task}] scored {scored}/{len(flat)} rows")
+
     correct_sum = 0
     correct_norm = 0
     records = []
     for idx, row in enumerate(rows):
-        prompt, choices = choice_texts(row)
-        sums, means = score_choices(runner, tokenizer, prompt, choices)
-        pred_sum = int(max(range(len(sums)), key=sums.__getitem__))
-        pred_norm = int(max(range(len(means)), key=means.__getitem__))
+        pred_sum = int(max(range(len(sums[idx])), key=sums[idx].__getitem__))
+        pred_norm = int(max(range(len(means[idx])), key=means[idx].__getitem__))
         gold = int(row["answer_idx"])  # type: ignore[arg-type]
         correct_sum += int(pred_sum == gold)
         correct_norm += int(pred_norm == gold)
         records.append(
-            {"task": task, "idx": idx, "pred": pred_sum, "pred_norm": pred_norm, "gold": gold, "scores": sums}
+            {"task": task, "idx": idx, "pred": pred_sum, "pred_norm": pred_norm, "gold": gold, "scores": sums[idx]}
         )
-        if (idx + 1) % 50 == 0:
-            print(f"[{task}] {idx + 1}/{len(rows)} acc_norm={correct_norm / (idx + 1):.3f}")
     _write_records(out_dir / f"{task}.jsonl", records)
     return {
         "task": task,
@@ -258,16 +297,12 @@ def run_choice_task(runner, tokenizer, task: str, rows, args, out_dir: Path) -> 
 
 
 def run_code_task(runner, tokenizer, task: str, rows, args, out_dir: Path) -> Dict[str, object]:
-    records = []
-    eos = tokenizer.eos_token_id
-    for idx, row in enumerate(rows):
-        prompt = str(row["prompt"])
-        input_ids = torch.tensor([tokenizer(prompt, add_special_tokens=False).input_ids], dtype=torch.long)
-        generated = runner.greedy(input_ids, args.max_new_tokens, eos)
-        completion = tokenizer.decode(generated[0, input_ids.shape[1] :], skip_special_tokens=True)
-        records.append({"task_id": row["task_id"], "completion": truncate_code(completion)})
-        if (idx + 1) % 10 == 0:
-            print(f"[{task}] generated {idx + 1}/{len(rows)}")
+    prompts = [str(row["prompt"]) for row in rows]
+    completions = _batched_generate(runner, tokenizer, task, prompts, args)
+    records = [
+        {"task_id": row["task_id"], "completion": truncate_code(completion)}
+        for row, completion in zip(rows, completions)
+    ]
     _write_records(out_dir / f"{task}_samples.jsonl", records)
     return {
         "task": task,
@@ -294,6 +329,8 @@ def main() -> int:
     parser.add_argument("--out_dir", default=None, help="Default: results/<mode>[_adapter].")
     parser.add_argument("--limit", type=int, default=0, help="Per-task example cap (0 = all).")
     parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=8, help="Prompts per generation batch.")
+    parser.add_argument("--score_batch", type=int, default=16, help="Rows per choice-scoring batch.")
     parser.add_argument("--local_files_only", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 

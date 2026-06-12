@@ -1119,6 +1119,35 @@ def test_cached_greedy_generation_matches_uncached() -> None:
     assert model.router_noise.current_mask is None
 
 
+def test_batched_left_padded_generation_matches_single_rows() -> None:
+    torch.manual_seed(28)
+    base = TinyCausalLM()
+    model = TrajectoryEnsembleForCausalLM(
+        base_model=base,
+        num_trajectories=3,
+        agg_dim=4,
+        noise_scale=0.4,
+        top_k=2,
+        context_seed_gate=True,
+    )
+    with torch.no_grad():
+        nn.init.normal_(model.aggregator.out_proj.weight, std=0.5)
+        nn.init.normal_(model.aggregator.out_proj.bias, std=0.5)
+
+    long_prompt = torch.tensor([[1, 3, 4, 5]], dtype=torch.long)
+    short_prompt = torch.tensor([[1, 6, 7]], dtype=torch.long)
+    single_long = model.greedy_generate(long_prompt, max_new_tokens=5, use_cache=True)
+    single_short = model.greedy_generate(short_prompt, max_new_tokens=5, use_cache=True)
+
+    batch_ids = torch.tensor([[1, 3, 4, 5], [0, 1, 6, 7]], dtype=torch.long)
+    batch_mask = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]], dtype=torch.long)
+    batched = model.greedy_generate(
+        batch_ids, attention_mask=batch_mask, max_new_tokens=5, use_cache=True
+    )
+    assert torch.equal(batched[0, 4:], single_long[0, 4:])
+    assert torch.equal(batched[1, 4:], single_short[0, 3:])
+
+
 def test_encode_batch_masks_prompt_but_keeps_completion_targets() -> None:
     tokenizer = ToyTokenizer()
     batch = encode_batch(
@@ -1229,6 +1258,7 @@ if __name__ == "__main__":
     test_freeze_seed_noise_trains_aggregator_only_but_keeps_noise_active()
     test_token_routing_trace_capture_shapes_and_alpha()
     test_cached_greedy_generation_matches_uncached()
+    test_batched_left_padded_generation_matches_single_rows()
     test_decontamination_ngram_filter_catches_eval_overlap()
     test_junk_filter_and_hard_prefix_selection()
     test_evaluate_answer_extraction_and_code_truncation()

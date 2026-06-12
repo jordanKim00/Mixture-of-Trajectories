@@ -39,7 +39,7 @@ if [ ! -f "outputs/${RUN}/trajectory_adapter.pt" ]; then
     --train_file "data/train/${RUN}_mix.jsonl" \
     --num_trajectories "${TRAJ}" \
     --steps "${STEPS}" \
-    --batch_size 1 \
+    --batch_size 2 \
     --max_length 512 \
     --noise_init_std 0.5 \
     --noise_scale 0.3 \
@@ -56,19 +56,19 @@ fi
 echo "== [3/5] eval: base reference =="
 if [ ! -f "results/${RUN}_base/metrics.json" ]; then
   python scripts/evaluate.py --mode base --tasks "${EVAL_TASKS}" \
-    --limit "${MATH_LIMIT}" --out_dir "results/${RUN}_base"
+    --limit "${MATH_LIMIT}" --batch_size 16 --out_dir "results/${RUN}_base"
   python scripts/evaluate.py --mode base --tasks "${CHOICE_TASKS}" \
-    --limit "${CHOICE_LIMIT}" --out_dir "results/${RUN}_base_choice"
+    --limit "${CHOICE_LIMIT}" --score_batch 32 --out_dir "results/${RUN}_base_choice"
 fi
 
 echo "== [4/5] eval: fused adapter + no-seed control =="
 if [ ! -f "results/${RUN}_fused/metrics.json" ]; then
   python scripts/evaluate.py --mode fused --adapter "outputs/${RUN}/trajectory_adapter.pt" \
     --num_trajectories "${TRAJ}" --tasks "${EVAL_TASKS}" \
-    --limit "${MATH_LIMIT}" --out_dir "results/${RUN}_fused"
+    --limit "${MATH_LIMIT}" --batch_size 8 --out_dir "results/${RUN}_fused"
   python scripts/evaluate.py --mode fused --adapter "outputs/${RUN}/trajectory_adapter.pt" \
     --num_trajectories "${TRAJ}" --tasks "${CHOICE_TASKS}" \
-    --limit "${CHOICE_LIMIT}" --out_dir "results/${RUN}_fused_choice"
+    --limit "${CHOICE_LIMIT}" --score_batch 16 --out_dir "results/${RUN}_fused_choice"
 fi
 
 echo "== [5/5] trace for the viewer =="
