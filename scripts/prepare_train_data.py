@@ -26,6 +26,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from data_quality import looks_like_junk  # noqa: E402
 from decontamination import build_eval_ngram_index, is_contaminated  # noqa: E402
 
 DEFAULT_OUT = ROOT / "data" / "train"
@@ -181,6 +182,7 @@ def _collect(
         target = max(1, int(round(total * ratio)))
         kept = 0
         dropped = 0
+        junk = 0
         try:
             for example in loader():
                 text = _example_text(example)
@@ -189,12 +191,15 @@ def _collect(
                 if is_contaminated(text, ngram_index):
                     dropped += 1
                     continue
+                if "text" in example and looks_like_junk(text):
+                    junk += 1
+                    continue
                 example["source"] = name
                 collected.append(example)
                 kept += 1
                 if kept >= target:
                     break
-            print(f"[train] {name}: kept {kept}/{target} (decontaminated {dropped})")
+            print(f"[train] {name}: kept {kept}/{target} (decontaminated {dropped}, junk {junk})")
         except Exception as exc:  # noqa: BLE001 - skip broken/gated sources
             print(f"[train] {name}: FAILED ({type(exc).__name__}: {exc})", file=sys.stderr)
     random.Random(seed).shuffle(collected)

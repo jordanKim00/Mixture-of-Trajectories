@@ -46,6 +46,8 @@ def _load_script_module(name: str, filename: str):
 
 _DECONTAM = _load_script_module("decontamination_for_tests", "decontamination.py")
 _EVALUATE = _load_script_module("evaluate_for_tests", "evaluate.py")
+_DATA_QUALITY = _load_script_module("data_quality_for_tests", "data_quality.py")
+_MINER = _load_script_module("mine_hard_prefixes_for_tests", "mine_hard_prefixes.py")
 
 
 class ToyEncoding:
@@ -1022,6 +1024,53 @@ def test_decontamination_ngram_filter_catches_eval_overlap() -> None:
     assert _DECONTAM.is_contaminated("what is two plus two", short_index, n=8)
 
 
+def test_junk_filter_and_hard_prefix_selection() -> None:
+    spam = (
+        "Hi! On site stv24.info you can find Aryana with the service Role playing "
+        "for date. Call Ximena or send a SMS and enjoy our dating service today."
+    )
+    stuffing = "battery powered light fixtures battery operated light fixture cordless lamp " * 4
+    clean = (
+        "The proof follows because the sequence is bounded and monotone, so it "
+        "converges to a limit that we can then identify with the supremum of the set."
+    )
+    assert _DATA_QUALITY.looks_like_junk(spam)
+    assert _DATA_QUALITY.looks_like_junk(stuffing)
+    assert not _DATA_QUALITY.looks_like_junk(clean)
+
+    def row(name, ce, dis, div):
+        return {
+            "text": clean + f" Case {name} considers what happens when the bound is not tight.",
+            "mining": {
+                "score": ce,
+                "base_ce": ce,
+                "gold_nll_std": dis,
+                "route_divergence": div,
+                "router_entropy": 1.0,
+            },
+        }
+
+    scored = [
+        row("A", 3.0, 0.01, 0.00),  # hard only because of raw CE
+        row("B", 2.0, 0.50, 0.50),  # trajectories disagree -> should win
+        row("C", 1.0, 0.05, 0.05),
+        {"text": spam, "mining": {"score": 9.0, "base_ce": 9.0, "gold_nll_std": 0.0,
+                                  "route_divergence": 0.0, "router_entropy": 9.0}},
+    ]
+    args = SimpleNamespace(
+        keep_fraction=1.0,
+        base_ce_percentile_cap=100.0,
+        weight_base_ce=1.0,
+        weight_nll_std=2.0,
+        weight_route_div=1.0,
+        weight_entropy=0.25,
+    )
+    selected = _MINER.select_hard(scored, args)
+    assert len(selected) == 3  # spam row dropped
+    assert selected[0]["mining"]["gold_nll_std"] == 0.50  # disagreement outranks raw CE
+    assert all("score_raw" in row["mining"] for row in selected)
+
+
 def test_evaluate_answer_extraction_and_code_truncation() -> None:
     assert _EVALUATE.extract_last_number("the answer is #### 1,234.5 ok") == "1234.5"
     assert _EVALUATE.extract_last_number("no digits here") is None
@@ -1141,6 +1190,7 @@ if __name__ == "__main__":
     test_freeze_seed_noise_trains_aggregator_only_but_keeps_noise_active()
     test_token_routing_trace_capture_shapes_and_alpha()
     test_decontamination_ngram_filter_catches_eval_overlap()
+    test_junk_filter_and_hard_prefix_selection()
     test_evaluate_answer_extraction_and_code_truncation()
     test_encode_batch_masks_prompt_but_keeps_completion_targets()
     test_encode_batch_can_train_on_full_text_or_prompt()
