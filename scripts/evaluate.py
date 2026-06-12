@@ -102,6 +102,11 @@ class FusedRunner:
         )
         if args.adapter:
             self.model.load_adapter(args.adapter)
+            # load_adapter restores the checkpoint's disable_seed_noise flag;
+            # the CLI ablation flag must win or the no-seed control silently
+            # evaluates with seeds enabled.
+            if args.disable_seed_noise:
+                self.model.router_noise.disable_noise = True
         self.model.eval()
         self.input_device = self.model.input_device
 

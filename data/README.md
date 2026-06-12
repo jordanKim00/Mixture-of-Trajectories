@@ -76,6 +76,25 @@ datasets>=3) and FinQA is omitted until a reliably hosted mirror is chosen;
 both substitutions keep the bucket intent (implicit commonsense reasoning,
 numeric reasoning lives in NuminaMath).
 
+## Task-family holdout (strict)
+
+The twelve eval task families are fully held out from ALL training stages:
+no test sets, no validation sets, **no train splits, and no rephrased
+derivatives** inside open mixtures. Enforcement is two-layer:
+
+1. provenance filtering at load time (`EVAL_FAMILY_MARKERS` in
+   `prepare_train_data.py`): rows whose `source`/`dataset` tags reference
+   gsm8k/svamp/addsub/singleeq/multiarith/arc/openbookqa/siqa/hellaswag/
+   humaneval (and mbpp, as a code-eval relative) are dropped — this catches
+   e.g. the GSM8K-train-derived subset inside NuminaMath-CoT and math/QA
+   subsets inside Tulu-3;
+2. the 8-gram decontamination filter against `data/eval/` catches verbatim
+   and near-verbatim leaks that carry no provenance tag.
+
+This keeps the comparison with training-free RoE clean: the adapter never
+sees any data from the evaluated task families, so gains cannot come from
+task-distribution memorization.
+
 ## Decontamination
 
 `scripts/prepare_train_data.py` builds a normalized word 8-gram index over

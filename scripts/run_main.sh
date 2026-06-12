@@ -8,6 +8,7 @@
 #   docker compose -f docker/docker-compose.yml run --rm moe-aggregate bash scripts/run_main.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 STEPS="${STEPS:-2000}"
 MATH_LIMIT="${MATH_LIMIT:-100}"
@@ -39,7 +40,7 @@ if [ ! -f "outputs/${RUN}/trajectory_adapter.pt" ]; then
     --train_file "data/train/${RUN}_mix.jsonl" \
     --num_trajectories "${TRAJ}" \
     --steps "${STEPS}" \
-    --batch_size 2 \
+    --batch_size 1 \
     --max_length 1024 \
     --noise_init_std 0.5 \
     --noise_scale 0.3 \

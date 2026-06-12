@@ -57,6 +57,7 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
         context_seed_gate: bool = True,
         context_scale_max_delta: float = 0.5,
         seed_init_mode: str = "orthogonal",
+        seed_inject_mode: str = "first",
         aggregator_relative_keys: bool = False,
     ) -> None:
         super().__init__()
@@ -85,6 +86,7 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
             context_seed_gate=context_seed_gate,
             context_scale_max_delta=context_scale_max_delta,
             seed_init_mode=seed_init_mode,
+            inject_mode=seed_inject_mode,
         )
         self.aggregator = BaseAnchoredResidualAggregator(
             hidden_size=hidden_size,
@@ -121,6 +123,7 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
         context_seed_gate: bool = True,
         context_scale_max_delta: float = 0.5,
         seed_init_mode: str = "orthogonal",
+        seed_inject_mode: str = "first",
         aggregator_relative_keys: bool = False,
         local_files_only: bool = True,
         torch_dtype: torch.dtype = torch.bfloat16,
@@ -153,6 +156,7 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
             context_seed_gate=context_seed_gate,
             context_scale_max_delta=context_scale_max_delta,
             seed_init_mode=seed_init_mode,
+            seed_inject_mode=seed_inject_mode,
             aggregator_relative_keys=aggregator_relative_keys,
         )
 
@@ -221,6 +225,8 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
             "aggregator_value_mode": self.aggregator.value_mode,
             "aggregator_relative_keys": self.aggregator.relative_keys,
             "seed_init_mode": self.router_noise.seed_init_mode,
+            "seed_inject_mode": self.router_noise.inject_mode,
+            "seed_inject_layers": self.router_noise.inject_layer_ids,
         }
 
     def adapter_regularization(
@@ -285,6 +291,12 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
             raise ValueError(
                 "checkpoint uses context_seed_gate=True; construct the wrapper with "
                 "context_seed_gate=True before loading"
+            )
+        checkpoint_inject_mode = str(config.get("seed_inject_mode", self.router_noise.inject_mode))
+        if checkpoint_inject_mode != self.router_noise.inject_mode:
+            raise ValueError(
+                f"checkpoint uses seed_inject_mode={checkpoint_inject_mode!r}; construct the "
+                f"wrapper with the same seed_inject_mode before loading"
             )
         checkpoint_uses_null_candidate = bool(
             config.get(
@@ -567,17 +579,27 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
                 "trajectory_oracle_num_candidates": int(pre_norm_by_traj.shape[1] - start_idx),
             }
 
+        chunk_size = 128
         nll_by_traj = []
         ce_by_candidate = []
         for traj_idx in range(start_idx, pre_norm_by_traj.shape[1]):
             traj_hidden = self.deepseek_model.norm(pre_norm_by_traj[:, traj_idx])
-            traj_logits = self.lm_head(traj_hidden).float()
-            shift_logits = traj_logits[:, :-1, :].contiguous()
-            shift_labels = shift_labels_source.to(shift_logits.device)
+            shift_labels = shift_labels_source.to(traj_hidden.device)
             valid = shift_labels.ne(-100)
             safe_labels = shift_labels.clamp_min(0)
-            log_probs = F.log_softmax(shift_logits, dim=-1)
-            nll = -log_probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+            seq_minus_1 = shift_labels.shape[1]
+            # Chunk the LM-head pass over the sequence; gradients still flow,
+            # but full-sequence vocab logits are never materialized at once.
+            nll_chunks = []
+            for start in range(0, seq_minus_1, chunk_size):
+                end = min(start + chunk_size, seq_minus_1)
+                chunk_logits = self.lm_head(traj_hidden[:, start:end]).float()
+                log_probs = F.log_softmax(chunk_logits, dim=-1)
+                chunk_labels = safe_labels[:, start:end]
+                nll_chunks.append(
+                    -log_probs.gather(dim=-1, index=chunk_labels.unsqueeze(-1)).squeeze(-1)
+                )
+            nll = torch.cat(nll_chunks, dim=1)
             nll_by_traj.append(nll)
             if valid.any():
                 ce_by_candidate.append(float(nll[valid].detach().mean().cpu().item()))
@@ -609,27 +631,44 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
         pre_norm_by_traj: torch.Tensor,
         labels: torch.Tensor,
         detach_to_cpu: bool,
+        chunk_size: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-trajectory gold NLL/top1, chunked over the sequence.
+
+        Full-sequence vocab logits per trajectory are ~1GB at 1k tokens, which
+        OOMs the LM-head device when stacked across trajectories. All callers
+        are no-grad diagnostics, so the LM head runs in slices.
+        """
+
         labels = labels.to(self.output_device)
         shift_labels = labels[:, 1:].contiguous()
         valid = shift_labels.ne(-100)
         safe_labels = shift_labels.clamp_min(0)
+        seq_minus_1 = shift_labels.shape[1]
 
         nll_by_traj = []
         top1_by_traj = []
-        for traj_idx in range(pre_norm_by_traj.shape[1]):
-            traj_pre_norm = pre_norm_by_traj[:, traj_idx]
-            traj_hidden = self.deepseek_model.norm(traj_pre_norm)
-            traj_logits = self.lm_head(traj_hidden).float()
-            shift_logits = traj_logits[:, :-1, :].contiguous()
-            log_probs = F.log_softmax(shift_logits, dim=-1)
-            nll = -log_probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-            top1 = shift_logits.argmax(dim=-1)
-            if detach_to_cpu:
-                nll = nll.detach().float().cpu()
-                top1 = top1.detach().cpu()
-            nll_by_traj.append(nll)
-            top1_by_traj.append(top1)
+        with torch.no_grad():
+            for traj_idx in range(pre_norm_by_traj.shape[1]):
+                traj_hidden = self.deepseek_model.norm(pre_norm_by_traj[:, traj_idx])
+                nll_chunks = []
+                top1_chunks = []
+                for start in range(0, seq_minus_1, chunk_size):
+                    end = min(start + chunk_size, seq_minus_1)
+                    chunk_logits = self.lm_head(traj_hidden[:, start:end]).float()
+                    log_probs = F.log_softmax(chunk_logits, dim=-1)
+                    chunk_labels = safe_labels[:, start:end]
+                    nll_chunks.append(
+                        -log_probs.gather(dim=-1, index=chunk_labels.unsqueeze(-1)).squeeze(-1)
+                    )
+                    top1_chunks.append(chunk_logits.argmax(dim=-1))
+                nll = torch.cat(nll_chunks, dim=1)
+                top1 = torch.cat(top1_chunks, dim=1)
+                if detach_to_cpu:
+                    nll = nll.float().cpu()
+                    top1 = top1.cpu()
+                nll_by_traj.append(nll)
+                top1_by_traj.append(top1)
 
         valid_out = valid.detach().cpu() if detach_to_cpu else valid
         return torch.stack(nll_by_traj, dim=1), torch.stack(top1_by_traj, dim=1), valid_out

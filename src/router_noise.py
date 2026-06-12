@@ -101,6 +101,7 @@ class SeedRouterNoise(nn.Module):
         context_seed_gate: bool = False,
         context_scale_max_delta: float = 0.5,
         seed_init_mode: str = "orthogonal",
+        inject_mode: str = "first",
     ) -> None:
         super().__init__()
         if num_trajectories not in (3, 5):
@@ -113,6 +114,8 @@ class SeedRouterNoise(nn.Module):
             raise ValueError("train_router_mode must be one of {'hard', 'soft_all', 'st_topk'}")
         if seed_init_mode not in ("gaussian", "orthogonal"):
             raise ValueError("seed_init_mode must be one of {'gaussian', 'orthogonal'}")
+        if inject_mode not in ("first", "all"):
+            raise ValueError("inject_mode must be one of {'first', 'all'}")
         if soft_temperature <= 0:
             raise ValueError("soft_temperature must be positive")
         if context_seed_gate and hidden_size is None:
@@ -132,6 +135,13 @@ class SeedRouterNoise(nn.Module):
         self.context_seed_gate = bool(context_seed_gate)
         self.context_scale_max_delta = float(context_scale_max_delta)
         self.seed_init_mode = seed_init_mode
+        self.inject_mode = inject_mode
+        # "all" mode: per-layer seeds are registered once the MoE layers are
+        # discovered during patching (register_inject_layers).
+        self.inject_layer_ids: Optional[List[int]] = None
+        self.layer_noise: Optional[nn.Parameter] = None
+        self.raw_layer_noise_scale: Optional[nn.Parameter] = None
+        self._noise_init_std = float(noise_init_std)
         self.noise = nn.Parameter(torch.empty(num_trajectories - 1, n_experts))
         raw_scale_init = math.log(noise_scale / (noise_scale_max - noise_scale))
         self.raw_noise_scale = nn.Parameter(
@@ -181,6 +191,38 @@ class SeedRouterNoise(nn.Module):
         self.record_mask = None
         self.current_mask = None
 
+    def register_inject_layers(self, layer_ids: List[int]) -> None:
+        """Create per-layer seeds once MoE layers are known (inject_mode='all')."""
+
+        self.inject_layer_ids = sorted(int(layer) for layer in layer_ids)
+        if self.inject_mode != "all" or self.layer_noise is not None:
+            return
+        num_layers = len(self.inject_layer_ids)
+        rows = self.num_trajectories - 1
+        init = torch.stack(
+            [
+                _orthogonal_centered_init(rows, self.n_experts, self._noise_init_std)
+                if self.seed_init_mode == "orthogonal"
+                else (lambda t: t - t.mean(dim=-1, keepdim=True))(
+                    torch.randn(rows, self.n_experts) * self._noise_init_std
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.layer_noise = nn.Parameter(init)
+        raw_scale_init = math.log(self.noise_scale / (self.noise_scale_max - self.noise_scale))
+        self.raw_layer_noise_scale = nn.Parameter(
+            torch.full((num_layers, rows, 1), float(raw_scale_init), dtype=torch.float32)
+        )
+
+    def _layer_slot(self, layer_idx: Optional[int]) -> Optional[int]:
+        if self.inject_mode != "all" or self.inject_layer_ids is None or layer_idx is None:
+            return None
+        try:
+            return self.inject_layer_ids.index(int(layer_idx))
+        except ValueError:
+            return None
+
     def centered_noise(self) -> torch.Tensor:
         return self.noise - self.noise.mean(dim=-1, keepdim=True)
 
@@ -191,6 +233,25 @@ class SeedRouterNoise(nn.Module):
         if self.disable_noise:
             return torch.zeros_like(self.centered_noise().float())
         return self.centered_noise().float() * self.noise_scale_value()
+
+    def effective_noise_for_layer(self, layer_idx: Optional[int]) -> torch.Tensor:
+        slot = self._layer_slot(layer_idx)
+        if slot is None or self.layer_noise is None or self.raw_layer_noise_scale is None:
+            return self.effective_noise()
+        if self.disable_noise:
+            return torch.zeros(
+                self.num_trajectories - 1, self.n_experts, device=self.layer_noise.device
+            )
+        noise = self.layer_noise[slot]
+        centered = noise - noise.mean(dim=-1, keepdim=True)
+        scale = self.noise_scale_max * torch.sigmoid(self.raw_layer_noise_scale[slot].float())
+        return centered.float() * scale
+
+    def noise_scale_value_for_layer(self, layer_idx: Optional[int]) -> torch.Tensor:
+        slot = self._layer_slot(layer_idx)
+        if slot is None or self.raw_layer_noise_scale is None:
+            return self.noise_scale_value()
+        return self.noise_scale_max * torch.sigmoid(self.raw_layer_noise_scale[slot].float())
 
     def context_multiplier(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         if not self.context_seed_gate or self.context_scale_proj is None or self.context_norm is None:
@@ -225,12 +286,15 @@ class SeedRouterNoise(nn.Module):
         self,
         hidden_states: torch.Tensor,
         dtype: torch.dtype,
+        layer_idx: Optional[int] = None,
     ) -> tuple[Optional[torch.Tensor], Optional[List[float]]]:
         batch_rows = hidden_states.shape[0]
         if batch_rows % self.num_trajectories != 0:
             return None, None
         batch = batch_rows // self.num_trajectories
-        effective = self.effective_noise().to(device=hidden_states.device, dtype=dtype)
+        effective = self.effective_noise_for_layer(layer_idx).to(
+            device=hidden_states.device, dtype=dtype
+        )
         if self.frozen_context_multiplier is not None:
             multiplier = self.frozen_context_multiplier.to(device=hidden_states.device)
             if multiplier.shape[0] != batch:
@@ -243,12 +307,14 @@ class SeedRouterNoise(nn.Module):
         if multiplier is not None:
             effective_by_batch = effective.unsqueeze(0) * multiplier.to(dtype=dtype).unsqueeze(-1)
             scale_values = (
-                self.noise_scale_value().to(device=hidden_states.device).view(1, -1)
+                self.noise_scale_value_for_layer(layer_idx).to(device=hidden_states.device).view(1, -1)
                 * multiplier.detach().float()
             ).mean(dim=0)
         else:
             effective_by_batch = effective.unsqueeze(0).expand(batch, -1, -1)
-            scale_values = self.noise_scale_value().to(device=hidden_states.device).view(-1)
+            scale_values = (
+                self.noise_scale_value_for_layer(layer_idx).to(device=hidden_states.device).view(-1)
+            )
 
         zero = torch.zeros(batch, 1, self.n_experts, device=hidden_states.device, dtype=dtype)
         full = torch.cat([zero, effective_by_batch], dim=1)
@@ -261,10 +327,8 @@ class SeedRouterNoise(nn.Module):
         )
         return full.reshape(batch_rows, self.n_experts), scale_with_base.cpu().tolist()
 
-    def diversity_loss(self) -> torch.Tensor:
-        """Penalize cosine collapse among non-base seed vectors."""
-
-        effective = self.effective_noise()
+    @staticmethod
+    def _cosine_collapse(effective: torch.Tensor) -> torch.Tensor:
         normalized = F.normalize(effective, dim=-1, eps=1e-6)
         cosine = normalized @ normalized.transpose(0, 1)
         eye = torch.eye(cosine.shape[0], device=cosine.device, dtype=torch.bool)
@@ -273,7 +337,26 @@ class SeedRouterNoise(nn.Module):
             return cosine.sum() * 0.0
         return off_diag.pow(2).mean()
 
+    def diversity_loss(self) -> torch.Tensor:
+        """Penalize cosine collapse among non-base seed vectors."""
+
+        if self.inject_mode == "all" and self.layer_noise is not None:
+            losses = [
+                self._cosine_collapse(self.effective_noise_for_layer(layer_idx))
+                for layer_idx in (self.inject_layer_ids or [])
+            ]
+            if losses:
+                return torch.stack(losses).mean()
+        return self._cosine_collapse(self.effective_noise())
+
     def l2_loss(self) -> torch.Tensor:
+        if self.inject_mode == "all" and self.layer_noise is not None:
+            losses = [
+                self.effective_noise_for_layer(layer_idx).pow(2).mean()
+                for layer_idx in (self.inject_layer_ids or [])
+            ]
+            if losses:
+                return torch.stack(losses).mean()
         return self.effective_noise().pow(2).mean()
 
     def context_gate_l2_loss(self) -> torch.Tensor:
@@ -303,11 +386,11 @@ class SeedRouterNoise(nn.Module):
         return self.full_bias(device, dtype).index_select(0, traj_ids)
 
     def should_inject(self, layer_idx: int) -> bool:
-        return (
-            not self.disable_noise
-            and self.target_layer_idx is not None
-            and layer_idx == self.target_layer_idx
-        )
+        if self.disable_noise:
+            return False
+        if self.inject_mode == "all":
+            return self.inject_layer_ids is not None and int(layer_idx) in self.inject_layer_ids
+        return self.target_layer_idx is not None and layer_idx == self.target_layer_idx
 
     def use_relaxed_training_router(self, layer_idx: int) -> bool:
         return (
@@ -510,7 +593,9 @@ def _trajectory_gate_forward(self, hidden_states):
     seed_scale_by_traj: Optional[List[float]] = None
 
     if router_noise is not None and layer_idx is not None and router_noise.should_inject(layer_idx):
-        row_bias, seed_scale_by_traj = router_noise.bias_for_hidden_states(hidden_states, logits.dtype)
+        row_bias, seed_scale_by_traj = router_noise.bias_for_hidden_states(
+            hidden_states, logits.dtype, layer_idx=layer_idx
+        )
         if row_bias is not None:
             logits = logits + row_bias.repeat_interleave(seq_len, dim=0)
             noise_applied = True
@@ -691,4 +776,5 @@ def patch_deepseek_moe_gates(model: nn.Module, router_noise: SeedRouterNoise) ->
         raise ValueError(
             f"target_layer_idx={router_noise.target_layer_idx} was not found in patched MoE layers"
         )
+    router_noise.register_inject_layers(sorted(patched_layers))
     return sorted(patched_layers)

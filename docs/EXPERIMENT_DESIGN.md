@@ -161,6 +161,7 @@ The first experiments should compare:
 - `train_router_mode=hard` versus `st_topk`.
 - `--context_seed_gate` versus `--no-context_seed_gate`.
 - `--seed_init_mode orthogonal` versus `--seed_init_mode gaussian`.
+- `--seed_inject_mode first` versus `--seed_inject_mode all` (per-layer seeds).
 - `--include_null_aggregation_candidate` versus `--no-include_null_aggregation_candidate`.
 - `--aggregator_value_mode delta` versus `--aggregator_value_mode absolute`.
 - `--aggregator_relative_keys` versus `--no-aggregator_relative_keys`.

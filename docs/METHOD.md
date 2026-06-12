@@ -37,6 +37,14 @@ m_p(x) = 1 + delta tanh(Wc LN(mean_valid hidden_base))
 
 - Noise is injected before softmax and top-k, matching the canonical location
   of noisy sparse MoE gating.
+- `seed_inject_mode=all` attaches an independent centered trainable seed (and
+  bounded scale) to every MoE router layer instead of only the first
+  (`(L, N-1, E)` parameters, orthogonally initialized per layer). The shared
+  prompt-level context gate multiplier applies to every layer. The straight-
+  through dense surrogate stays first-layer-only for compute reasons; later
+  layers receive gradient through their selected-expert gate weights. This is
+  the escalation axis for stronger path divergence when first-layer seeding
+  alone does not produce enough complementary evidence.
 - DeepSeek backbone, router weights, experts, shared experts, final norm, and
   LM head are frozen.
 - The aggregator operates before DeepSeek's original final norm. No extra final

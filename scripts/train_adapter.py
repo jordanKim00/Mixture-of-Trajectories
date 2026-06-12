@@ -317,6 +317,12 @@ def main() -> None:
     parser.add_argument("--noise_scale_max", type=float, default=1.0)
     parser.add_argument("--noise_init_std", type=float, default=0.02)
     parser.add_argument("--seed_init_mode", choices=["gaussian", "orthogonal"], default="orthogonal")
+    parser.add_argument(
+        "--seed_inject_mode",
+        choices=["first", "all"],
+        default="first",
+        help="'all' attaches an independent trainable seed to every MoE router layer.",
+    )
     parser.add_argument("--train_router_mode", choices=["hard", "soft_all", "st_topk"], default="st_topk")
     parser.add_argument("--soft_temperature", type=float, default=1.0)
     parser.add_argument("--residual_scale_max", type=float, default=0.25)
@@ -410,6 +416,7 @@ def main() -> None:
         context_seed_gate=args.context_seed_gate,
         context_scale_max_delta=args.context_scale_max_delta,
         seed_init_mode=args.seed_init_mode,
+        seed_inject_mode=args.seed_inject_mode,
         aggregator_relative_keys=args.aggregator_relative_keys,
         local_files_only=args.local_files_only,
     )

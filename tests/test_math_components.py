@@ -1080,6 +1080,49 @@ def test_evaluate_answer_extraction_and_code_truncation() -> None:
     assert _EVALUATE.truncate_code(body) == "    return x + 1\n"
 
 
+def test_all_layer_seed_injection_applies_per_layer_noise() -> None:
+    torch.manual_seed(29)
+    base = TinyCausalLM()
+    model = TrajectoryEnsembleForCausalLM(
+        base_model=base,
+        num_trajectories=3,
+        agg_dim=4,
+        noise_scale=0.4,
+        top_k=2,
+        seed_inject_mode="all",
+    )
+    # Open the identity-initialized output projection so task gradients can
+    # reach the seeds (the Wo=0 cold start would otherwise zero them).
+    with torch.no_grad():
+        nn.init.normal_(model.aggregator.out_proj.weight, std=0.5)
+    noise = model.router_noise
+    assert noise.inject_mode == "all"
+    assert noise.inject_layer_ids == [1, 2]
+    assert noise.layer_noise is not None
+    assert noise.layer_noise.shape == (2, 2, 4)
+    # Per-layer seeds are centered and layer-distinct.
+    assert torch.allclose(noise.layer_noise.mean(dim=-1), torch.zeros(2, 2), atol=1e-5)
+    assert not torch.allclose(noise.layer_noise[0], noise.layer_noise[1])
+
+    input_ids = torch.tensor([[1, 3, 4, 5]], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    output = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=input_ids.clone(),
+        return_route_stats=True,
+    )
+    applied = [k for k, v in output.route_stats.items() if v["noise_applied"]]
+    assert applied == [1, 2]
+    output.loss.backward()
+    assert noise.layer_noise.grad is not None
+    assert noise.layer_noise.grad.abs().sum() > 0
+    # Layer params are part of the trainable adapter group.
+    trainable_ids = {id(p) for p in model.trainable_parameters()}
+    assert id(noise.layer_noise) in trainable_ids
+    assert id(noise.raw_layer_noise_scale) in trainable_ids
+
+
 def test_cached_greedy_generation_matches_uncached() -> None:
     torch.manual_seed(27)
     base = TinyCausalLM()
@@ -1257,6 +1300,7 @@ if __name__ == "__main__":
     test_forward_selective_kl_is_finite_and_bounded_at_identity_init()
     test_freeze_seed_noise_trains_aggregator_only_but_keeps_noise_active()
     test_token_routing_trace_capture_shapes_and_alpha()
+    test_all_layer_seed_injection_applies_per_layer_noise()
     test_cached_greedy_generation_matches_uncached()
     test_batched_left_padded_generation_matches_single_rows()
     test_decontamination_ngram_filter_catches_eval_overlap()

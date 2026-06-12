@@ -88,8 +88,26 @@ STAGE1_SOURCES: List[tuple[str, float, Callable[[], Iterator[Dict[str, str]]]]] 
 # Stage 3: SFT pairs -> {"prompt": ..., "completion": ...} or {"messages": ...}
 # ---------------------------------------------------------------------------
 
+# Task-family holdout: the twelve RoE eval families are NEVER trained on, not
+# even their train splits or rephrased derivatives inside open mixtures. Rows
+# whose provenance tags match these markers are dropped at load time; the
+# n-gram filter then catches verbatim test leaks on top.
+EVAL_FAMILY_MARKERS = (
+    "gsm8k", "svamp", "addsub", "singleeq", "single_eq", "multiarith",
+    "arc", "ai2_arc", "openbookqa", "obqa", "social_i_qa", "socialiqa",
+    "siqa", "hellaswag", "humaneval", "mbpp",
+)
+
+
+def _from_eval_family(provenance: object) -> bool:
+    tag = str(provenance or "").lower()
+    return any(marker in tag for marker in EVAL_FAMILY_MARKERS)
+
+
 def _sft_tulu3() -> Iterator[Dict[str, object]]:
     for row in _stream("allenai/tulu-3-sft-mixture"):
+        if _from_eval_family(row.get("source")) or _from_eval_family(row.get("dataset")):
+            continue
         messages = row.get("messages")
         if isinstance(messages, list) and messages and messages[-1].get("role") == "assistant":
             yield {"messages": messages}
@@ -97,6 +115,8 @@ def _sft_tulu3() -> Iterator[Dict[str, object]]:
 
 def _sft_numinamath() -> Iterator[Dict[str, object]]:
     for row in _stream("AI-MO/NuminaMath-CoT"):
+        if _from_eval_family(row.get("source")):
+            continue
         yield {"prompt": row["problem"], "completion": " " + row["solution"]}
 
 
