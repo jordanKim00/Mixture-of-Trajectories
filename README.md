@@ -36,6 +36,17 @@ python scripts/smoke_generate.py --num_trajectories 3 --max_new_tokens 4
 The smoke scripts load the cached DeepSeek-MoE checkpoint with
 `local_files_only=True` by default.
 
+Evaluation data helpers:
+
+```bash
+python scripts/prepare_eval_data.py --out_dir data/eval
+python scripts/prepare_train_data.py --out_dir data/train --eval_dir data/eval
+python scripts/mine_hard_prefixes.py --pool data/train/stage1_continuation.jsonl
+```
+
+`scripts/decontamination.py` builds n-gram filters from `data/eval/*.jsonl` so
+adapter training data can be checked against the evaluation suite.
+
 Adapter training:
 
 ```bash
