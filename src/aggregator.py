@@ -94,6 +94,7 @@ class BaseAnchoredResidualAggregator(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         return_stats: bool = False,
         return_alpha: bool = False,
+        global_hidden_override: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[AggregatorStats]] | Tuple[torch.Tensor, Optional[AggregatorStats], torch.Tensor]:
         if hidden_by_traj.ndim != 4:
             raise ValueError(
@@ -111,7 +112,12 @@ class BaseAnchoredResidualAggregator(nn.Module):
 
         base_normed = self.norm(base_hidden.to(compute_dtype))
         q = self.q_proj(base_normed)  # (B, S, A)
-        if attention_mask is not None:
+        if global_hidden_override is not None:
+            # Incremental decoding: caller supplies the running masked mean of
+            # base_normed over the full prefix, which a single-step forward
+            # cannot see.
+            global_hidden = global_hidden_override.to(dtype=compute_dtype, device=base_hidden.device)
+        elif attention_mask is not None:
             mask = attention_mask.to(device=base_hidden.device, dtype=compute_dtype)
             denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
             global_hidden = (base_normed * mask.unsqueeze(-1)).sum(dim=1) / denom

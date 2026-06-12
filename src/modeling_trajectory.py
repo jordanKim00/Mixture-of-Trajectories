@@ -324,11 +324,14 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor],
+        past_length: int = 0,
     ) -> torch.Tensor:
         if position_ids is not None:
             return position_ids
         seq_len = input_ids.shape[1]
-        return torch.arange(seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0)
+        return torch.arange(
+            past_length, past_length + seq_len, dtype=torch.long, device=input_ids.device
+        ).unsqueeze(0)
 
     def _prepare_attention_mask(
         self,
@@ -336,6 +339,7 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
         batch_size: int,
         seq_len: int,
         inputs_embeds: torch.Tensor,
+        past_key_values_length: int = 0,
     ) -> Optional[torch.Tensor]:
         if self.deepseek_model._use_flash_attention_2:
             has_padding = attention_mask is not None and bool((attention_mask == 0).any().item())
@@ -347,13 +351,13 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
                 attention_mask,
                 (batch_size, seq_len),
                 inputs_embeds,
-                0,
+                past_key_values_length,
             )
         return module._prepare_4d_causal_attention_mask(
             attention_mask,
             (batch_size, seq_len),
             inputs_embeds,
-            0,
+            past_key_values_length,
         )
 
     def _run_deepseek_pre_norm(
@@ -361,12 +365,18 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        past_key_values=None,
+        use_cache: bool = False,
     ) -> torch.Tensor:
         input_ids = input_ids.to(self.input_device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.input_device)
         if position_ids is not None:
             position_ids = position_ids.to(self.input_device)
+
+        past_length = 0
+        if past_key_values is not None and hasattr(past_key_values, "get_seq_length"):
+            past_length = int(past_key_values.get_seq_length())
 
         inputs_embeds = self.deepseek_model.embed_tokens(input_ids)
         batch_size, seq_len, _ = inputs_embeds.shape
@@ -375,8 +385,9 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
             batch_size=batch_size,
             seq_len=seq_len,
             inputs_embeds=inputs_embeds,
+            past_key_values_length=past_length,
         )
-        position_ids = self._prepare_position_ids(input_ids, position_ids)
+        position_ids = self._prepare_position_ids(input_ids, position_ids, past_length)
 
         hidden_states = inputs_embeds
         for decoder_layer in self.deepseek_model.layers:
@@ -384,9 +395,9 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
                 hidden_states,
                 attention_mask=prepared_mask,
                 position_ids=position_ids,
-                past_key_value=None,
+                past_key_value=past_key_values,
                 output_attentions=False,
-                use_cache=False,
+                use_cache=use_cache,
             )
             hidden_states = layer_outputs[0]
         return hidden_states
@@ -1241,6 +1252,7 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 16,
         eos_token_id: Optional[int] = None,
+        use_cache: bool = True,
     ) -> torch.LongTensor:
         was_training = self.training
         self.eval()
@@ -1250,15 +1262,126 @@ class TrajectoryEnsembleForCausalLM(nn.Module):
         else:
             attention_mask = attention_mask.to(self.input_device)
 
-        generated = input_ids
-        attn = attention_mask
-        for _ in range(max_new_tokens):
-            output = self.forward(generated, attention_mask=attn)
-            next_token = output.logits[:, -1].argmax(dim=-1, keepdim=True).to(generated.device)
-            generated = torch.cat([generated, next_token], dim=-1)
-            attn = torch.cat([attn, torch.ones_like(next_token, device=attn.device)], dim=-1)
-            if eos_token_id is not None and bool((next_token == eos_token_id).all().item()):
-                break
-        if was_training:
-            self.train(True)
-        return generated
+        try:
+            if use_cache:
+                return self._greedy_generate_cached(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=eos_token_id,
+                )
+            generated = input_ids
+            attn = attention_mask
+            done = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+            for _ in range(max_new_tokens):
+                output = self.forward(generated, attention_mask=attn)
+                next_token = output.logits[:, -1].argmax(dim=-1, keepdim=True).to(generated.device)
+                if eos_token_id is not None:
+                    next_token = torch.where(
+                        done.unsqueeze(1), torch.full_like(next_token, eos_token_id), next_token
+                    )
+                generated = torch.cat([generated, next_token], dim=-1)
+                attn = torch.cat([attn, torch.ones_like(next_token, device=attn.device)], dim=-1)
+                if eos_token_id is not None:
+                    done = done | (next_token.squeeze(1) == eos_token_id)
+                    if bool(done.all().item()):
+                        break
+            return generated
+        finally:
+            if was_training:
+                self.train(True)
+
+    def _greedy_generate_cached(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_new_tokens: int,
+        eos_token_id: Optional[int],
+    ) -> torch.LongTensor:
+        """KV-cached greedy decoding (supports left-padded batches).
+
+        Each trajectory keeps its own KV rows (B*N cache rows): trajectories
+        diverge from the first MoE layer onward, so their attention states are
+        not shareable. The aggregator's global query term and the context seed
+        gate are prompt-level statistics, so the gate multiplier is frozen
+        after prefill and the global mean is maintained as a running masked sum
+        of base_normed states. Position ids are derived from the attention
+        mask, so batched prompts must be LEFT padded.
+        """
+
+        from transformers.cache_utils import DynamicCache
+
+        batch, prompt_len = input_ids.shape
+        compute_dtype = self.aggregator.q_proj.weight.dtype
+        cache = DynamicCache()
+        expanded_attn = self._expand_by_trajectory(attention_mask)
+        prefill_positions = (expanded_attn.long().cumsum(dim=-1) - 1).clamp_min(0)
+        previous_frozen = self.router_noise.frozen_context_multiplier
+        self.router_noise.current_mask = attention_mask.detach().bool()
+        try:
+            pre_norm = self._run_deepseek_pre_norm(
+                input_ids=self._expand_by_trajectory(input_ids),
+                attention_mask=expanded_attn,
+                position_ids=prefill_positions,
+                past_key_values=cache,
+                use_cache=True,
+            )
+            self.router_noise.current_mask = None
+            self.router_noise.frozen_context_multiplier = self.router_noise.last_context_multiplier
+
+            pre_norm = pre_norm.reshape(batch, self.num_trajectories, prompt_len, -1)
+            fused_pre_norm, _ = self.aggregator(pre_norm, attention_mask=attention_mask)
+            logits = self.lm_head(self.deepseek_model.norm(fused_pre_norm[:, -1:])).float()
+            next_token = logits[:, -1].argmax(dim=-1, keepdim=True).to(input_ids.device)
+
+            base_normed = self.aggregator.norm(pre_norm[:, 0].to(compute_dtype))
+            valid = attention_mask.to(device=base_normed.device, dtype=compute_dtype)
+            normed_sum = (base_normed * valid.unsqueeze(-1)).sum(dim=1)
+            normed_count = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+            generated = torch.cat([input_ids, next_token], dim=-1)
+            attn = torch.cat(
+                [attention_mask, torch.ones_like(next_token, device=attention_mask.device)], dim=-1
+            )
+            done = torch.zeros(batch, dtype=torch.bool, device=generated.device)
+            if eos_token_id is not None:
+                done = next_token.squeeze(1) == eos_token_id
+                if bool(done.all().item()):
+                    return generated
+
+            for _ in range(max_new_tokens - 1):
+                step_positions = attn.long().sum(dim=-1, keepdim=True) - 1
+                step_pre_norm = self._run_deepseek_pre_norm(
+                    input_ids=self._expand_by_trajectory(generated[:, -1:]),
+                    attention_mask=self._expand_by_trajectory(attn),
+                    position_ids=self._expand_by_trajectory(step_positions),
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+                step_pre_norm = step_pre_norm.reshape(batch, self.num_trajectories, 1, -1)
+                step_base_normed = self.aggregator.norm(step_pre_norm[:, 0].to(compute_dtype))
+                normed_sum = normed_sum + step_base_normed[:, 0]
+                normed_count = normed_count + 1.0
+                global_hidden = normed_sum / normed_count
+
+                fused_step, _ = self.aggregator(
+                    step_pre_norm,
+                    attention_mask=None,
+                    global_hidden_override=global_hidden,
+                )
+                logits = self.lm_head(self.deepseek_model.norm(fused_step)).float()
+                next_token = logits[:, -1].argmax(dim=-1, keepdim=True).to(generated.device)
+                if eos_token_id is not None:
+                    next_token = torch.where(
+                        done.unsqueeze(1), torch.full_like(next_token, eos_token_id), next_token
+                    )
+                generated = torch.cat([generated, next_token], dim=-1)
+                attn = torch.cat([attn, torch.ones_like(next_token, device=attn.device)], dim=-1)
+                if eos_token_id is not None:
+                    done = done | (next_token.squeeze(1) == eos_token_id)
+                    if bool(done.all().item()):
+                        break
+            return generated
+        finally:
+            self.router_noise.frozen_context_multiplier = previous_frozen
+            self.router_noise.current_mask = None

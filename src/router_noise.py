@@ -147,6 +147,10 @@ class SeedRouterNoise(nn.Module):
         self.record_token_routing = False
         self.record_mask: Optional[torch.Tensor] = None
         self.current_mask: Optional[torch.Tensor] = None
+        # KV-cached decoding: the context gate must keep the prompt-level seed
+        # multiplier instead of recomputing it from a single new token.
+        self.frozen_context_multiplier: Optional[torch.Tensor] = None
+        self.last_context_multiplier: Optional[torch.Tensor] = None
         self.layer_stats: Dict[int, RoutingLayerStats] = {}
         self.path_stats: Dict[int, RoutingPathStats] = {}
         self.token_routing: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -227,7 +231,15 @@ class SeedRouterNoise(nn.Module):
             return None, None
         batch = batch_rows // self.num_trajectories
         effective = self.effective_noise().to(device=hidden_states.device, dtype=dtype)
-        multiplier = self.context_multiplier(hidden_states)
+        if self.frozen_context_multiplier is not None:
+            multiplier = self.frozen_context_multiplier.to(device=hidden_states.device)
+            if multiplier.shape[0] != batch:
+                raise ValueError(
+                    f"frozen_context_multiplier batch {multiplier.shape[0]} != {batch}"
+                )
+        else:
+            multiplier = self.context_multiplier(hidden_states)
+            self.last_context_multiplier = multiplier.detach() if multiplier is not None else None
         if multiplier is not None:
             effective_by_batch = effective.unsqueeze(0) * multiplier.to(dtype=dtype).unsqueeze(-1)
             scale_values = (

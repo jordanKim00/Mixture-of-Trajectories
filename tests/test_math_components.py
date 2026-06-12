@@ -1080,6 +1080,45 @@ def test_evaluate_answer_extraction_and_code_truncation() -> None:
     assert _EVALUATE.truncate_code(body) == "    return x + 1\n"
 
 
+def test_cached_greedy_generation_matches_uncached() -> None:
+    torch.manual_seed(27)
+    base = TinyCausalLM()
+    model = TrajectoryEnsembleForCausalLM(
+        base_model=base,
+        num_trajectories=3,
+        agg_dim=4,
+        noise_scale=0.4,
+        top_k=2,
+        context_seed_gate=True,
+    )
+    # Make fusion non-trivial so the incremental aggregator path is exercised.
+    with torch.no_grad():
+        nn.init.normal_(model.aggregator.out_proj.weight, std=0.5)
+        nn.init.normal_(model.aggregator.out_proj.bias, std=0.5)
+    input_ids = torch.tensor([[1, 3, 4, 5]], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+
+    cached = model.greedy_generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=6,
+        use_cache=True,
+    )
+    uncached = model.greedy_generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=6,
+        use_cache=False,
+    )
+    # Toy layers are positionwise, so both paths must produce identical tokens
+    # (the identity-initialized context gate keeps the multiplier at exactly 1).
+    assert cached.shape == uncached.shape
+    assert torch.equal(cached, uncached)
+    # Generation must not leak frozen state into later training forwards.
+    assert model.router_noise.frozen_context_multiplier is None
+    assert model.router_noise.current_mask is None
+
+
 def test_encode_batch_masks_prompt_but_keeps_completion_targets() -> None:
     tokenizer = ToyTokenizer()
     batch = encode_batch(
@@ -1189,6 +1228,7 @@ if __name__ == "__main__":
     test_forward_selective_kl_is_finite_and_bounded_at_identity_init()
     test_freeze_seed_noise_trains_aggregator_only_but_keeps_noise_active()
     test_token_routing_trace_capture_shapes_and_alpha()
+    test_cached_greedy_generation_matches_uncached()
     test_decontamination_ngram_filter_catches_eval_overlap()
     test_junk_filter_and_hard_prefix_selection()
     test_evaluate_answer_extraction_and_code_truncation()

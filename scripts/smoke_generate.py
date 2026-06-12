@@ -43,6 +43,12 @@ def main() -> None:
     parser.add_argument("--local_files_only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prompt", default="다음 수를 더하시오: 17 + 25 =")
     parser.add_argument("--max_new_tokens", type=int, default=4)
+    parser.add_argument("--use_cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--verify_against_no_cache",
+        action="store_true",
+        help="Also run the uncached path and compare generated token ids and timing.",
+    )
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -70,13 +76,37 @@ def main() -> None:
 
     input_ids = encode_prompt(tokenizer, args.prompt).to(model.input_device)
     attention_mask = torch.ones_like(input_ids, device=model.input_device)
+
+    import time
+
+    started = time.time()
     generated = model.greedy_generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
         max_new_tokens=args.max_new_tokens,
         eos_token_id=tokenizer.eos_token_id,
+        use_cache=args.use_cache,
     )
+    elapsed = time.time() - started
+    print(f"[cache={args.use_cache}] {elapsed:.2f}s")
     print(tokenizer.decode(generated[0], skip_special_tokens=True))
+
+    if args.verify_against_no_cache and args.use_cache:
+        started = time.time()
+        reference = model.greedy_generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=False,
+        )
+        elapsed_ref = time.time() - started
+        match = generated.shape == reference.shape and bool((generated == reference).all().item())
+        print(f"[cache=False] {elapsed_ref:.2f}s | tokens match cached run: {match}")
+        if not match:
+            print("cached :", tokenizer.decode(generated[0], skip_special_tokens=True))
+            print("nocache:", tokenizer.decode(reference[0], skip_special_tokens=True))
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

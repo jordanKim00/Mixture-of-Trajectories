@@ -295,6 +295,17 @@ nonzero. This is the cost of exact base-logit identity at initialization.
   is optimized. This separates "the perturbation must be learned" from "the
   perturbation must exist".
 - Supported trajectory counts are `N=3` and `N=5`.
+- Greedy generation is KV-cached by default with one cache row per trajectory
+  (`B*N` rows): trajectories diverge from the first MoE layer, so their
+  attention states cannot be shared. Two prompt-level statistics are handled
+  explicitly during incremental decoding: the context seed gate multiplier is
+  frozen after prefill (the gate is defined on the prompt, not on each new
+  token), and the aggregator's global query term uses a running masked mean of
+  base-route normed hiddens. `use_cache=False` keeps the exact full-recompute
+  path; with the identity-initialized gate both paths produce identical tokens
+  (covered by a toy test). Note the cached/uncached paths differ semantically
+  for a trained context gate: uncached pools over prompt+generated tokens,
+  cached pools over the prompt only.
 - See `docs/METHOD_AUDIT.md` for the explicit mathematical failure modes and
   the refinements used to avoid overclaiming.
 

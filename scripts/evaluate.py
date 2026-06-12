@@ -16,8 +16,9 @@ Modes:
   --mode fused  trajectory wrapper (optionally with --adapter checkpoint)
   --mode base   raw frozen HF model, no wrapper (clean baseline)
 
-The fused mode has no KV cache yet, so generation cost is O(len^2); use
---limit for smoke runs and report it alongside results.
+Fused generation uses per-trajectory KV caching (B*N cache rows, prompt-frozen
+context gate, running global mean for the aggregator query), so decode cost is
+O(len) per trajectory like standard generation.
 """
 
 import argparse
@@ -113,9 +114,16 @@ class FusedRunner:
         return output.logits
 
     @torch.no_grad()
-    def greedy(self, input_ids: torch.Tensor, max_new_tokens: int, eos_token_id: Optional[int]) -> torch.Tensor:
+    def greedy(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_new_tokens: int,
+        eos_token_id: Optional[int],
+    ) -> torch.Tensor:
         return self.model.greedy_generate(
             input_ids=input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
         )
